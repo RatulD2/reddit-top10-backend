@@ -520,29 +520,21 @@ function findSimilarThreads(threads, searchQuery, minRelevance = 0.85) { // High
   return relevantThreads;
 }
 
-// Fetch and parse Reddit RSS feed
-async function fetchRedditRss({ subreddit, sort = 'top', t = 'week', size = 10 }) {
-  const url = `https://www.reddit.com/r/${subreddit}/${sort}/.rss?sort=${sort}&t=${t}`;
-  const res = await fetch(url, {
-    headers: {
-      'User-Agent': 'Mozilla/5.0 (compatible; topthreads/1.0; +https://onreddit.netlify.app)'
-    }
-  });
-  if (!res.ok) throw new Error(`Reddit RSS HTTP error! status: ${res.status}`);
-  const xml = await res.text();
-  const parsed = await xml2js.parseStringPromise(xml, { explicitArray: false });
-  const items = parsed.feed.entry || [];
-  // Ensure items is always an array
-  const threads = Array.isArray(items) ? items : [items];
-  return threads.slice(0, size).map(item => ({
-    title: item.title._ || item.title,
-    url: item.link && item.link.href ? item.link.href : '',
-    upvotes: 0, // RSS does not provide upvotes
-    comments: 0, // RSS does not provide comments
-    score: 0, // RSS does not provide score
+// Fetch top posts from Lemmy community
+async function fetchLemmyTopPosts({ community = 'marketing', limit = 10, instance = 'lemmy.world' }) {
+  const url = `https://${instance}/api/v3/post/list?community_name=${encodeURIComponent(community)}&type=Top&limit=${limit}`;
+  const res = await fetch(url);
+  if (!res.ok) throw new Error(`Lemmy API error: ${res.status}`);
+  const data = await res.json();
+  return (data.posts || []).map(p => ({
+    title: p.post.name,
+    url: p.post.url || `https://${instance}/post/${p.post.id}`,
+    upvotes: p.post.score,
+    comments: p.counts.comments,
+    score: p.post.score,
     relevance: 0, // Not available
-    subreddit: subreddit,
-    created: item.updated ? Date.parse(item.updated) / 1000 : 0,
+    subreddit: p.community.name, // Lemmy community
+    created: new Date(p.post.published).getTime() / 1000,
     engagement_rate: 0, // Not available
     opportunity_score: 0 // Not available
   }));
@@ -553,19 +545,24 @@ app.get("/api/reddit", async (req, res) => {
   try {
     let allThreads = [];
     const searchQuery = q ? q.trim() : '';
-    let subredditsToSearch = subreddit ? [subreddit] : countrySubreddits[country] || countrySubreddits.global;
+    let communitiesToSearch = subreddit ? [subreddit] : countrySubreddits[country] || countrySubreddits.global;
     if (searchQuery && !subreddit) {
-      const marketingSubreddits = findRelevantMarketingSubreddits(searchQuery);
-      const globalSubreddits = countrySubreddits.global;
-      subredditsToSearch = [...new Set([...subredditsToSearch, ...marketingSubreddits, ...globalSubreddits])];
+      const marketingCommunities = findRelevantMarketingSubreddits(searchQuery);
+      const globalCommunities = countrySubreddits.global;
+      communitiesToSearch = [...new Set([...communitiesToSearch, ...marketingCommunities, ...globalCommunities])];
     }
-    // Fetch from all relevant subreddits using RSS
-    for (const sub of subredditsToSearch) {
+    // Fetch from all relevant Lemmy communities
+    for (const community of communitiesToSearch) {
       try {
-        const threads = await fetchRedditRss({ subreddit: sub, sort });
+        if (!community || typeof community !== 'string' || !/^[A-Za-z0-9_]+$/.test(community)) continue; // skip invalid names
+        const threads = await fetchLemmyTopPosts({ community, limit: 10 });
         allThreads = [...allThreads, ...threads];
       } catch (err) {
-        console.error(`Error fetching RSS from ${sub}:`, err);
+        if (err.message.includes('Lemmy API error: 404')) {
+          console.warn(`Community not found on Lemmy: ${community}`);
+          continue;
+        }
+        console.error(`Error fetching from Lemmy community ${community}:`, err);
         continue;
       }
     }
@@ -579,7 +576,7 @@ app.get("/api/reddit", async (req, res) => {
     res.json(filteredThreads.slice(0, 10));
   } catch (err) {
     console.error('Error:', err);
-    res.status(500).json({ error: "Failed to fetch from Reddit RSS" });
+    res.status(500).json({ error: "Failed to fetch from Lemmy" });
   }
 });
 
