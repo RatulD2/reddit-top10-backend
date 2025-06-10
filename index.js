@@ -519,39 +519,20 @@ function findSimilarThreads(threads, searchQuery, minRelevance = 0.85) { // High
   return relevantThreads;
 }
 
-let redditToken = null;
-let tokenExpiresAt = 0;
+// Replace fetchRedditData to use Pushshift API
+async function fetchPushshiftData({ subreddit, query, sort, afterDays = 7, size = 100 }) {
+  let url = 'https://api.pushshift.io/reddit/search/submission/?';
+  const params = [];
+  if (subreddit) params.push(`subreddit=${encodeURIComponent(subreddit)}`);
+  if (query) params.push(`q=${encodeURIComponent(query)}`);
+  params.push(`sort_type=score`);
+  params.push(`sort=desc`);
+  params.push(`after=${afterDays}d`);
+  params.push(`size=${size}`);
+  url += params.join('&');
 
-async function getRedditToken() {
-  if (redditToken && Date.now() < tokenExpiresAt) {
-    return redditToken;
-  }
-  const auth = Buffer.from(`${process.env.REDDIT_CLIENT_ID}:${process.env.REDDIT_CLIENT_SECRET}`).toString('base64');
-  const res = await fetch('https://www.reddit.com/api/v1/access_token', {
-    method: 'POST',
-    headers: {
-      'Authorization': `Basic ${auth}`,
-      'Content-Type': 'application/x-www-form-urlencoded',
-      'User-Agent': process.env.REDDIT_USER_AGENT
-    },
-    body: 'grant_type=client_credentials'
-  });
-  const data = await res.json();
-  redditToken = data.access_token;
-  tokenExpiresAt = Date.now() + (data.expires_in - 60) * 1000; // refresh 1 min early
-  return redditToken;
-}
-
-// Replace fetchRedditData with OAuth2 version
-async function fetchRedditData(url) {
-  const token = await getRedditToken();
-  const res = await fetch(url, {
-    headers: {
-      'Authorization': `Bearer ${token}`,
-      'User-Agent': process.env.REDDIT_USER_AGENT
-    }
-  });
-  if (!res.ok) throw new Error(`HTTP error! status: ${res.status}`);
+  const res = await fetch(url);
+  if (!res.ok) throw new Error(`Pushshift HTTP error! status: ${res.status}`);
   return res.json();
 }
 
@@ -578,56 +559,46 @@ function calculateEngagementScore(thread) {
 
 app.get("/api/reddit", async (req, res) => {
   const { q, subreddit, sort = "top", country = "global" } = req.query;
-  const time = "week";
-
+  // sort and country are not used by Pushshift, but kept for compatibility
   try {
     let allThreads = [];
     const searchQuery = q ? q.trim() : '';
-
-    // Get relevant subreddits based on keyword and country
     let subredditsToSearch = subreddit ? [subreddit] : countrySubreddits[country] || countrySubreddits.global;
-    
+
+    // If searching without subreddit, expand search to more subreddits
     if (searchQuery && !subreddit) {
-      // If searching without subreddit, expand search to more subreddits
       const marketingSubreddits = findRelevantMarketingSubreddits(searchQuery);
       const globalSubreddits = countrySubreddits.global;
       subredditsToSearch = [...new Set([...subredditsToSearch, ...marketingSubreddits, ...globalSubreddits])];
     }
 
-    // Filter out NSFW subreddits
-    subredditsToSearch = subredditsToSearch.filter(sub => !NSFW_SUBREDDITS.has(sub.toLowerCase()));
-
-    // Fetch from all relevant subreddits
+    // Fetch from all relevant subreddits using Pushshift
     for (const sub of subredditsToSearch) {
       try {
-        const url = `https://oauth.reddit.com/r/${sub}/${sort}.json?limit=100&t=${time}`;
-        const data = await fetchRedditData(url);
-        
-        const threads = data.data.children
-          .map((post) => post.data)
+        const data = await fetchPushshiftData({ subreddit: sub, query: searchQuery, sort });
+        const threads = (data.data || [])
           .filter(p => isContentSafe(p.title, sub))
           .map((p) => ({
             title: p.title,
-            url: "https://reddit.com" + p.permalink,
-            upvotes: p.ups,
+            url: p.full_link || `https://reddit.com${p.permalink}`,
+            upvotes: p.score,
             comments: p.num_comments,
             score: calculateEngagementScore({
-              upvotes: p.ups,
+              upvotes: p.score,
               comments: p.num_comments,
               created: p.created_utc
             }),
             relevance: searchQuery ? calculateKeywordRelevance(p.title, searchQuery) : 0,
             subreddit: sub,
             created: p.created_utc,
-            engagement_rate: (p.num_comments / p.ups) * 100,
+            engagement_rate: (p.num_comments / (p.score || 1)) * 100,
             opportunity_score: calculateMarketingOpportunityScore({
-              upvotes: p.ups,
+              upvotes: p.score,
               comments: p.num_comments,
               created: p.created_utc,
-              engagement_rate: (p.num_comments / p.ups) * 100
+              engagement_rate: (p.num_comments / (p.score || 1)) * 100
             })
           }));
-
         allThreads = [...allThreads, ...threads];
       } catch (err) {
         console.error(`Error fetching from ${sub}:`, err);
@@ -640,117 +611,31 @@ app.get("/api/reddit", async (req, res) => {
 
     // If there's a search query, prioritize matches
     if (searchQuery) {
-      // Find similar threads if exact matches are not found
       const similarThreads = findSimilarThreads(uniqueThreads, searchQuery);
-      
-      // Sort by relevance, opportunity score, and engagement rate
       similarThreads.sort((a, b) => {
         const relevanceDiff = b.relevance - a.relevance;
-        if (Math.abs(relevanceDiff) > 0.3) return relevanceDiff; // Lowered threshold
-        
+        if (Math.abs(relevanceDiff) > 0.3) return relevanceDiff;
         const opportunityDiff = b.opportunity_score - a.opportunity_score;
-        if (Math.abs(opportunityDiff) > 50) return opportunityDiff; // Lowered threshold
-        
+        if (Math.abs(opportunityDiff) > 50) return opportunityDiff;
         return b.engagement_rate - a.engagement_rate;
       });
-
-      // Take top 10 threads
       const topThreads = similarThreads.slice(0, 10);
-
-      // If we still have no results, return trending marketing posts
       if (topThreads.length === 0) {
-        const marketingSubreddits = ['marketing', 'socialmedia', 'digitalmarketing', 'content_marketing'];
-        let trendingThreads = [];
-        
-        for (const sub of marketingSubreddits) {
-          try {
-            const url = `https://oauth.reddit.com/r/${sub}/top.json?limit=25&t=week`;
-            const data = await fetchRedditData(url);
-            
-            const threads = data.data.children
-              .map((post) => post.data)
-              .filter(p => isContentSafe(p.title, sub))
-              .map((p) => ({
-                title: p.title,
-                url: "https://reddit.com" + p.permalink,
-                upvotes: p.ups,
-                comments: p.num_comments,
-                score: calculateEngagementScore({
-                  upvotes: p.ups,
-                  comments: p.num_comments,
-                  created: p.created_utc
-                }),
-                relevance: 0,
-                subreddit: sub,
-                created: p.created_utc,
-                engagement_rate: (p.num_comments / p.ups) * 100,
-                opportunity_score: calculateMarketingOpportunityScore({
-                  upvotes: p.ups,
-                  comments: p.num_comments,
-                  created: p.created_utc,
-                  engagement_rate: (p.num_comments / p.ups) * 100
-                })
-              }));
-            
-            trendingThreads = [...trendingThreads, ...threads];
-          } catch (err) {
-            console.error(`Error fetching trending from ${sub}:`, err);
-            continue;
-          }
-        }
-        
-        trendingThreads.sort((a, b) => b.opportunity_score - a.opportunity_score);
-        res.json(trendingThreads.slice(0, 10));
+        res.json(uniqueThreads.slice(0, 10));
       } else {
         res.json(topThreads);
       }
     } else {
-      // If no search query, sort by opportunity score and engagement rate
       uniqueThreads.sort((a, b) => {
         const opportunityDiff = b.opportunity_score - a.opportunity_score;
         if (Math.abs(opportunityDiff) > 50) return opportunityDiff;
         return b.engagement_rate - a.engagement_rate;
       });
-
       res.json(uniqueThreads.slice(0, 10));
     }
   } catch (err) {
     console.error('Error:', err);
-    // Return trending marketing posts as fallback
-    try {
-      const fallbackUrl = `https://oauth.reddit.com/r/marketing/top.json?limit=10&t=week`;
-      const fallbackData = await fetchRedditData(fallbackUrl);
-      
-      const fallbackThreads = fallbackData.data.children
-        .map((post) => post.data)
-        .filter(p => isContentSafe(p.title, 'marketing'))
-        .map((p) => ({
-          title: p.title,
-          url: "https://reddit.com" + p.permalink,
-          upvotes: p.ups,
-          comments: p.num_comments,
-          score: calculateEngagementScore({
-            upvotes: p.ups,
-            comments: p.num_comments,
-            created: p.created_utc
-          }),
-          relevance: 0,
-          subreddit: 'marketing',
-          created: p.created_utc,
-          engagement_rate: (p.num_comments / p.ups) * 100,
-          opportunity_score: calculateMarketingOpportunityScore({
-            upvotes: p.ups,
-            comments: p.num_comments,
-            created: p.created_utc,
-            engagement_rate: (p.num_comments / p.ups) * 100
-          })
-        }));
-      
-      res.json(fallbackThreads);
-    } catch (fallbackErr) {
-      console.error('Fallback error:', fallbackErr);
-      res.status(500).json({ error: "Failed to fetch from Reddit" });
-    }
+    res.status(500).json({ error: "Failed to fetch from Pushshift" });
   }
 });
 
