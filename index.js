@@ -1,6 +1,7 @@
 const express = require("express");
 const cors = require("cors");
 const fetch = require("node-fetch");
+require('dotenv').config();
 
 const app = express();
 
@@ -518,26 +519,40 @@ function findSimilarThreads(threads, searchQuery, minRelevance = 0.85) { // High
   return relevantThreads;
 }
 
-// Function to fetch Reddit data with retry
-async function fetchRedditData(url, retries = 3) {
-  for (let i = 0; i < retries; i++) {
-    try {
-      const response = await fetch(url, {
-        headers: {
-          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
-        }
-      });
-      
-      if (!response.ok) {
-        throw new Error(`HTTP error! status: ${response.status}`);
-      }
-      
-      return await response.json();
-    } catch (err) {
-      if (i === retries - 1) throw err;
-      await new Promise(resolve => setTimeout(resolve, 1000 * (i + 1)));
-    }
+let redditToken = null;
+let tokenExpiresAt = 0;
+
+async function getRedditToken() {
+  if (redditToken && Date.now() < tokenExpiresAt) {
+    return redditToken;
   }
+  const auth = Buffer.from(`${process.env.REDDIT_CLIENT_ID}:${process.env.REDDIT_CLIENT_SECRET}`).toString('base64');
+  const res = await fetch('https://www.reddit.com/api/v1/access_token', {
+    method: 'POST',
+    headers: {
+      'Authorization': `Basic ${auth}`,
+      'Content-Type': 'application/x-www-form-urlencoded',
+      'User-Agent': process.env.REDDIT_USER_AGENT
+    },
+    body: 'grant_type=client_credentials'
+  });
+  const data = await res.json();
+  redditToken = data.access_token;
+  tokenExpiresAt = Date.now() + (data.expires_in - 60) * 1000; // refresh 1 min early
+  return redditToken;
+}
+
+// Replace fetchRedditData with OAuth2 version
+async function fetchRedditData(url) {
+  const token = await getRedditToken();
+  const res = await fetch(url, {
+    headers: {
+      'Authorization': `Bearer ${token}`,
+      'User-Agent': process.env.REDDIT_USER_AGENT
+    }
+  });
+  if (!res.ok) throw new Error(`HTTP error! status: ${res.status}`);
+  return res.json();
 }
 
 // Function to calculate thread engagement score
@@ -585,7 +600,7 @@ app.get("/api/reddit", async (req, res) => {
     // Fetch from all relevant subreddits
     for (const sub of subredditsToSearch) {
       try {
-        const url = `https://www.reddit.com/r/${sub}/${sort}.json?limit=100&t=${time}`;
+        const url = `https://oauth.reddit.com/r/${sub}/${sort}.json?limit=100&t=${time}`;
         const data = await fetchRedditData(url);
         
         const threads = data.data.children
@@ -649,7 +664,7 @@ app.get("/api/reddit", async (req, res) => {
         
         for (const sub of marketingSubreddits) {
           try {
-            const url = `https://www.reddit.com/r/${sub}/top.json?limit=25&t=week`;
+            const url = `https://oauth.reddit.com/r/${sub}/top.json?limit=25&t=week`;
             const data = await fetchRedditData(url);
             
             const threads = data.data.children
@@ -703,7 +718,7 @@ app.get("/api/reddit", async (req, res) => {
     console.error('Error:', err);
     // Return trending marketing posts as fallback
     try {
-      const fallbackUrl = `https://www.reddit.com/r/marketing/top.json?limit=10&t=week`;
+      const fallbackUrl = `https://oauth.reddit.com/r/marketing/top.json?limit=10&t=week`;
       const fallbackData = await fetchRedditData(fallbackUrl);
       
       const fallbackThreads = fallbackData.data.children
