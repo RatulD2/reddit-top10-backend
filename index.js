@@ -1,6 +1,7 @@
 const express = require("express");
 const cors = require("cors");
 const fetch = require("node-fetch");
+const xml2js = require('xml2js');
 require('dotenv').config();
 
 const app = express();
@@ -519,123 +520,66 @@ function findSimilarThreads(threads, searchQuery, minRelevance = 0.85) { // High
   return relevantThreads;
 }
 
-// Replace fetchRedditData to use Pushshift API
-async function fetchPushshiftData({ subreddit, query, sort, afterDays = 7, size = 100 }) {
-  let url = 'https://api.pushshift.io/reddit/search/submission/?';
-  const params = [];
-  if (subreddit) params.push(`subreddit=${encodeURIComponent(subreddit)}`);
-  if (query) params.push(`q=${encodeURIComponent(query)}`);
-  params.push(`sort_type=score`);
-  params.push(`sort=desc`);
-  params.push(`after=${afterDays}d`);
-  params.push(`size=${size}`);
-  url += params.join('&');
-
-  const res = await fetch(url);
-  if (!res.ok) throw new Error(`Pushshift HTTP error! status: ${res.status}`);
-  return res.json();
-}
-
-// Function to calculate thread engagement score
-function calculateEngagementScore(thread) {
-  const upvoteWeight = 1.5;  // Increased weight for upvotes
-  const commentWeight = 2.5;  // Increased weight for comments
-  const timeWeight = 0.8;    // Increased time decay factor
-  
-  const now = Date.now() / 1000;
-  const ageInHours = (now - thread.created) / 3600;
-  const timeDecay = Math.exp(-ageInHours / 72); // Changed to 3 days decay for more recent content
-  
-  // Calculate engagement quality
-  const commentToUpvoteRatio = thread.comments / (thread.upvotes + 1);
-  const engagementQuality = Math.min(commentToUpvoteRatio * 2, 1); // Cap at 1
-  
-  return (
-    (thread.upvotes * upvoteWeight) +
-    (thread.comments * commentWeight) +
-    (engagementQuality * 1000) // Add engagement quality bonus
-  ) * timeDecay;
+// Fetch and parse Reddit RSS feed
+async function fetchRedditRss({ subreddit, sort = 'top', t = 'week', size = 10 }) {
+  const url = `https://www.reddit.com/r/${subreddit}/${sort}/.rss?sort=${sort}&t=${t}`;
+  const res = await fetch(url, {
+    headers: {
+      'User-Agent': 'Mozilla/5.0 (compatible; topthreads/1.0; +https://onreddit.netlify.app)'
+    }
+  });
+  if (!res.ok) throw new Error(`Reddit RSS HTTP error! status: ${res.status}`);
+  const xml = await res.text();
+  const parsed = await xml2js.parseStringPromise(xml, { explicitArray: false });
+  const items = parsed.feed.entry || [];
+  // Ensure items is always an array
+  const threads = Array.isArray(items) ? items : [items];
+  return threads.slice(0, size).map(item => ({
+    title: item.title._ || item.title,
+    url: item.link && item.link.href ? item.link.href : '',
+    upvotes: 0, // RSS does not provide upvotes
+    comments: 0, // RSS does not provide comments
+    score: 0, // RSS does not provide score
+    relevance: 0, // Not available
+    subreddit: subreddit,
+    created: item.updated ? Date.parse(item.updated) / 1000 : 0,
+    engagement_rate: 0, // Not available
+    opportunity_score: 0 // Not available
+  }));
 }
 
 app.get("/api/reddit", async (req, res) => {
   const { q, subreddit, sort = "top", country = "global" } = req.query;
-  // sort and country are not used by Pushshift, but kept for compatibility
   try {
     let allThreads = [];
     const searchQuery = q ? q.trim() : '';
     let subredditsToSearch = subreddit ? [subreddit] : countrySubreddits[country] || countrySubreddits.global;
-
-    // If searching without subreddit, expand search to more subreddits
     if (searchQuery && !subreddit) {
       const marketingSubreddits = findRelevantMarketingSubreddits(searchQuery);
       const globalSubreddits = countrySubreddits.global;
       subredditsToSearch = [...new Set([...subredditsToSearch, ...marketingSubreddits, ...globalSubreddits])];
     }
-
-    // Fetch from all relevant subreddits using Pushshift
+    // Fetch from all relevant subreddits using RSS
     for (const sub of subredditsToSearch) {
       try {
-        const data = await fetchPushshiftData({ subreddit: sub, query: searchQuery, sort });
-        const threads = (data.data || [])
-          .filter(p => isContentSafe(p.title, sub))
-          .map((p) => ({
-            title: p.title,
-            url: p.full_link || `https://reddit.com${p.permalink}`,
-            upvotes: p.score,
-            comments: p.num_comments,
-            score: calculateEngagementScore({
-              upvotes: p.score,
-              comments: p.num_comments,
-              created: p.created_utc
-            }),
-            relevance: searchQuery ? calculateKeywordRelevance(p.title, searchQuery) : 0,
-            subreddit: sub,
-            created: p.created_utc,
-            engagement_rate: (p.num_comments / (p.score || 1)) * 100,
-            opportunity_score: calculateMarketingOpportunityScore({
-              upvotes: p.score,
-              comments: p.num_comments,
-              created: p.created_utc,
-              engagement_rate: (p.num_comments / (p.score || 1)) * 100
-            })
-          }));
+        const threads = await fetchRedditRss({ subreddit: sub, sort });
         allThreads = [...allThreads, ...threads];
       } catch (err) {
-        console.error(`Error fetching from ${sub}:`, err);
+        console.error(`Error fetching RSS from ${sub}:`, err);
         continue;
       }
     }
-
     // Remove duplicates based on URL
     const uniqueThreads = Array.from(new Map(allThreads.map(t => [t.url, t])).values());
-
-    // If there's a search query, prioritize matches
+    // If there's a search query, filter by keyword in title
+    let filteredThreads = uniqueThreads;
     if (searchQuery) {
-      const similarThreads = findSimilarThreads(uniqueThreads, searchQuery);
-      similarThreads.sort((a, b) => {
-        const relevanceDiff = b.relevance - a.relevance;
-        if (Math.abs(relevanceDiff) > 0.3) return relevanceDiff;
-        const opportunityDiff = b.opportunity_score - a.opportunity_score;
-        if (Math.abs(opportunityDiff) > 50) return opportunityDiff;
-        return b.engagement_rate - a.engagement_rate;
-      });
-      const topThreads = similarThreads.slice(0, 10);
-      if (topThreads.length === 0) {
-        res.json(uniqueThreads.slice(0, 10));
-      } else {
-        res.json(topThreads);
-      }
-    } else {
-      uniqueThreads.sort((a, b) => {
-        const opportunityDiff = b.opportunity_score - a.opportunity_score;
-        if (Math.abs(opportunityDiff) > 50) return opportunityDiff;
-        return b.engagement_rate - a.engagement_rate;
-      });
-      res.json(uniqueThreads.slice(0, 10));
+      filteredThreads = uniqueThreads.filter(t => t.title.toLowerCase().includes(searchQuery.toLowerCase()));
     }
+    res.json(filteredThreads.slice(0, 10));
   } catch (err) {
     console.error('Error:', err);
-    res.status(500).json({ error: "Failed to fetch from Pushshift" });
+    res.status(500).json({ error: "Failed to fetch from Reddit RSS" });
   }
 });
 
